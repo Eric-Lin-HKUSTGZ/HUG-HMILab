@@ -20,16 +20,6 @@ logger = logging.getLogger(__name__)
 # Prediction output dir, excluded from input pkl discovery
 PRED_DIRNAME = "grasp_pred"
 
-# HO3D_v3 evaluation_xyz.json stores joints in MANO's RAW kinematic order
-# [wrist, index MCP/PIP/DIP, middle, pinky, ring, thumb CMC/MCP/IP, then tips
-# (thumb, index, middle, ring, pinky)]. Everything in this repo (manotorch
-# output, our 21-joint predictions) uses the reordered convention
-# [wrist, thumb x4, index x4, middle x4, ring x4, pinky x4] - the same perm as
-# manotorch/manolayer.py's final reorder. std[i] = raw[HO3D_RAW_TO_STD[i]].
-# Verified empirically: per-joint bone-length signatures match only under
-# this mapping (see TRAIN_HANDRECON.md).
-HO3D_RAW_TO_STD = [0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20]
-
 
 class GraspDataset(Dataset):
     """Dataset for grasp prediction from RGB + object mask.
@@ -298,10 +288,10 @@ class GraspDataset(Dataset):
         # (matches app/inference resolution via dataset_path / f"{stem}.pkl").
         stem = grasp_path.relative_to(self.dataset_path).with_suffix("").as_posix()
 
-        # HO3D_v3 eval pkls carry no segmentation mask (official eval set ships
-        # none; object_mask is empty bytes) but always store condition_point.
-        # The mask is only needed to sample a query point when condition_point
-        # is absent, so decode it lazily.
+        # Inference/eval pkls (e.g. produced by prepare_inputs.py) may carry a
+        # stored `condition_point` instead of an object mask; the mask is only
+        # needed to sample a query point when condition_point is absent, so
+        # decode it lazily.
         stored_uv = grasp_data.get("condition_point")
         depth_m = self._depth_meters(grasp_data["depth"])
         K_np = grasp_data["camera"]["K"]
@@ -343,16 +333,6 @@ class GraspDataset(Dataset):
             out["mano_shape"] = torch.from_numpy(grasp["shape"].flatten()).float()
             out["landmarks_3d"] = torch.from_numpy(grasp["landmarks_3d"]).float()
             out["landmarks_2d"] = torch.from_numpy(grasp["landmarks_2d"]).float()
-        elif "joints_gt" in grasp_data:
-            # HO3D_v3 evaluation split: GT is joints/verts only, no MANO params.
-            # Reorder joints from the official raw order to our standard order
-            # (see HO3D_RAW_TO_STD above); verts are MANO-template-ordered
-            # already and pass through unchanged.
-            joints_gt = np.asarray(grasp_data["joints_gt"], dtype=np.float32)[HO3D_RAW_TO_STD]
-            out["joints_gt"] = torch.from_numpy(joints_gt)
-            out["verts_gt"] = torch.from_numpy(
-                np.asarray(grasp_data["verts_gt"], dtype=np.float32)
-            )
         if self.use_rgb:
             out["rgb"] = self.rgb_transform(Image.fromarray(rgb_np))
         if self.use_depth:

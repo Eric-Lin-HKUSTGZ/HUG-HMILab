@@ -1,7 +1,7 @@
 # HUG-HMI-Lab
 
 HUG（Human Universal Grasping）在 HMILab 手物交互项目中的可运行集成版本。
-本仓库包含 HUG 原始推理代码，以及从 `HUG-for-Recon-Gen` 迁移的训练、评测、数据转换和可视化工具。
+本仓库包含 HUG 原始推理代码，以及训练、数据准备和可视化工具。
 
 给定一张 RGB-D 图像、相机内参和物体上的查询点，HUG 生成 99D MANO 抓取状态，并解码为手部关键点、网格和手腕位姿。
 
@@ -23,10 +23,9 @@ RGB-D + query point
 - `src/inference.py`：批量推理并写出 `grasp_pred/*.pkl`。
 - `src/visualize_predictions.py`：离线预测可视化 Web 服务。
 - `src/prepare_inputs.py`：任意 RGB-D + 内参转换为统一 224×224 pkl。
-- `src/train.py`：DDP 训练入口，支持 DexYCB/HO3D 混合训练。
-- `src/eval_test.py`：官方测试集评估（MPJPE、PA-MPJPE、MPVPE、PA-MPVPE）。
+- `src/train.py`：DDP 训练入口（1M-HUGs 抓取生成数据集）。
 - `src/models/`：DINOv2、PointNeXt、PointPainting、DiT、MANO。
-- `scripts/`：HO3D/DexYCB 转换、划分、统计和数据检查脚本。
+- `scripts/`：DINOv2 权重转换、1M-HUGs 验证集划分、预测渲染脚本。
 - `analysis_docs/`：模型、数据和推理流程说明。
 - `assets/`：MANO 资产、mesh faces、shape 和归一化统计量。
 
@@ -116,7 +115,7 @@ cd /root/code/HUG-HMILab
 
 ### 生成静态 PNG
 
-如果需要直接查看或批量归档图片，可使用迁移的纯 Python 渲染脚本：
+如果需要直接查看或批量归档图片，可使用纯 Python 渲染脚本：
 
 ```bash
 /root/code/vepfs/miniconda3/envs/hug/bin/python scripts/render_predictions.py \
@@ -126,38 +125,46 @@ cd /root/code/HUG-HMILab
 
 每个样本会生成一张六联图（RGB+2D joints、depth、front/side/angled 3D hand views 和信息面板），输出在 `prediction_images/`。
 
-## 训练与评测
+## 训练
 
-训练配置：
-
-- `configs/train_hug.yaml`：HUG 原始 1M-HUGs 训练配置；
-- `configs/train_handrecon.yaml`：DexYCB + HO3D 微调配置。
-
-完整训练示例：
+训练配置为 `configs/train_hug.yaml`，数据为 HUG 官方 1M-HUGs 抓取生成数据集
+（`/root/code/vepfs/dataset/1m-hugs/grasp_data`，约 1.28M 帧；验证集为
+录制级留出 split，见 `scripts/README.md`）。
 
 ```bash
 torchrun --nproc_per_node=4 -m hug.train \
-  --config configs/train_handrecon.yaml
+  --config configs/train_hug.yaml
 ```
 
-官方测试集评估：
+冒烟测试（少量步数 + 截断训练集，走完整 train/val/checkpoint 流程）：
 
 ```bash
-torchrun --nproc_per_node=4 -m hug.eval_test \
-  --config configs/train_handrecon.yaml
+torchrun --nproc_per_node=4 -m hug.train \
+  --config configs/train_hug.yaml \
+  --max-steps 30 --max-train-samples 20000
 ```
 
-纯 PyTorch PointNeXt 会在 SA 层构造较大的 kNN 临时张量；训练时应使用多卡和合适的 batch size。显存有限时可先降低 batch size 或使用单卡 smoke test；这不影响单样本推理和可视化。
+要点：
+
+- 输出目录与训练日志写在 vepfs（`output_dir`），勿写根分区（仅 20G）；
+  checkpoint 保存时剥离冻结 DINOv2（单文件 ~0.9G）。
+- 验证走真实推理路径 `sample()`（50 步 ODE 采样）不算 loss，指标为
+  MPJPE / PA-MPJPE / MPVPE / PA-MPVPE（mm）；多卡分片评估后 all_reduce 聚合。
+- `model_best.pt` 按验证 score 自动保存；`model.pt` 为周期性续训点，
+  checkpoint 内嵌 cfg + norm_stats，可直接被 `inference.py` / `app.py` 加载。
+- 纯 PyTorch PointNeXt 会在 SA 层构造较大的 kNN 临时张量；训练时应使用多卡
+  和合适的 batch size。显存有限时可先降低 batch size 或用单卡 smoke test；
+  这不影响单样本推理和可视化。
+- `output_dir/logs/` 下每个 rank 有完整文本日志与 error 日志；rank 0 另有
+  结构化 JSONL 训练日志（含 startup/train/validation/checkpoint 事件）。
 
 ## 数据约定
 
 - RGB 和深度会统一裁剪/缩放到 224×224，内参 K 同步调整。
 - 深度反投影为相机坐标系米制点云，默认以 query 点为中心做 0.2～0.3 m 球裁剪，再采样 4096 点。
 - MANO 状态为 `t(3) + wrist_R6D(6) + finger_pose_6D(90)`。
-- 训练时 query 点从 mask 内随机采样；评测 pkl 使用其 `condition_point`。
+- 训练时 query 点从 mask 内随机采样；推理 pkl 使用其 `condition_point`。
 - 推理 checkpoint 自带模型配置和 norm stats，避免模态开关与权重不匹配。
-
-HO3D/DexYCB 转换、6D 旋转约定、MANO wrist 平移参考点和评测口径的修复说明见 `analysis_docs/handrecon_conversion_bugs.md`。
 
 ## 论文
 

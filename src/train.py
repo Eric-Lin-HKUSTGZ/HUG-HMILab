@@ -1,10 +1,10 @@
 """DDP training for HUG (GraspFlowModel), configured by a YAML file.
 
 Launch (multi-GPU):
-    torchrun --nproc_per_node=4 -m src.train --config configs/train_hug.yaml
+    torchrun --nproc_per_node=4 -m hug.train --config configs/train_hug.yaml
 
 Smoke test (short run on a subset):
-    torchrun --nproc_per_node=4 -m src.train --config configs/train_hug.yaml \
+    torchrun --nproc_per_node=4 -m hug.train --config configs/train_hug.yaml \
         --max-steps 30 --max-train-samples 20000
 
 Loss (paper §4.2, Eq. 1 + optional 2D reprojection term):
@@ -216,14 +216,9 @@ def is_main(rank: int) -> bool:
 def build_datasets(cfg):
     """Train dataset + val dataset.
 
-    Two config styles:
-
-    1. Multi-dataset (preferred): `trainer.data.datasets` is a list of
-       {path, train_samples, val_samples} — explicit stem-list files per
-       dataset (absolute paths OK). Train/val are ConcatDatasets over entries.
-    2. Legacy single-dataset: `trainer.data.dataset_path` + recording-level
-       `val_split_file` (built by scripts/make_val_split.py), falling back to
-       a deterministic random frame-level split.
+    Single dataset at `trainer.data.dataset_path` + recording-level
+    `val_split_file` (built by scripts/make_val_split.py), falling back to
+    a deterministic random frame-level split.
     """
     data_cfg = cfg.trainer.data
     common = dict(
@@ -233,30 +228,6 @@ def build_datasets(cfg):
         use_rgb=cfg.trainer.model.get("use_rgb", True),
         use_depth=cfg.trainer.model.get("use_depth", True),
     )
-
-    if data_cfg.get("datasets"):
-        train_parts, val_parts = [], []
-        for entry in data_cfg.datasets:
-            train_parts.append(
-                GraspDataset(
-                    str(entry.path), samples_filename=str(entry.train_samples), **common
-                )
-            )
-            val_parts.append(
-                GraspDataset(
-                    str(entry.path), samples_filename=str(entry.val_samples), **common
-                )
-            )
-            logger.info(
-                f"{entry.path}: train={len(train_parts[-1])} val={len(val_parts[-1])}"
-            )
-        from torch.utils.data import ConcatDataset
-
-        train_ds = (
-            train_parts[0] if len(train_parts) == 1 else ConcatDataset(train_parts)
-        )
-        val_ds = val_parts[0] if len(val_parts) == 1 else ConcatDataset(val_parts)
-        return train_ds, val_ds
 
     dataset_path = str(data_cfg.dataset_path)
     full = GraspDataset(
@@ -294,16 +265,8 @@ def build_datasets(cfg):
 
 def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=None):
     train_cfg = cfg.trainer.train
-    if max_train_samples is not None:
-        if hasattr(train_ds, "grasp_files"):
-            train_ds.grasp_files = train_ds.grasp_files[:max_train_samples]
-        else:  # ConcatDataset: cap per part proportionally
-            from torch.utils.data import Subset
-
-            train_ds = Subset(
-                train_ds,
-                list(range(min(max_train_samples, len(train_ds)))),
-            )
+    if max_train_samples is not None and hasattr(train_ds, "grasp_files"):
+        train_ds.grasp_files = train_ds.grasp_files[:max_train_samples]
     sampler = DistributedSampler(
         train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
     )
@@ -317,80 +280,16 @@ def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=Non
         prefetch_factor=cfg.trainer.data.prefetch_factor,
         drop_last=True,
     )
-    # Val is evaluated on rank 0 only (see run_val); plain loaders suffice.
-    common_val = dict(
-        split="val",
-        n_points_input=cfg.trainer.data.n_points_input,
-        pcl_crop_radius=cfg.trainer.model.get("pcl_crop_radius", 0.3),
-        use_rgb=cfg.trainer.model.get("use_rgb", True),
-        use_depth=cfg.trainer.model.get("use_depth", True),
-    )
-    val_cfg = cfg.trainer.get("val")
-
-    if val_cfg is not None and val_cfg.get("datasets"):
-        # New style: per-dataset val loaders (mixed GT schemas allowed - e.g.
-        # DexYCB s0_val with MANO GT + HO3D_v3 eval with joints/verts GT).
-        val_loaders = []
-        parts = []
-        for entry in val_cfg.datasets:
-            ds = GraspDataset(
-                str(entry.path), samples_filename=str(entry.samples), **common_val
-            )
-            parts.append(ds)
-        total = sum(len(p) for p in parts)
-        max_total = val_cfg.get("max_samples")
-        if max_total is not None and total > int(max_total):
-            # 各数据集按占比等距采样，确定性、跨 checkpoint 可比
-            for ds in parts:
-                k = max(1, round(len(ds) * int(max_total) / total))
-                idx = sorted({round(i * len(ds) / k) for i in range(k)})
-                ds.grasp_files = [ds.grasp_files[i] for i in idx]
-            logger.info(
-                f"val subsample -> "
-                + ", ".join(f"{e.name}={len(p)}" for e, p in zip(val_cfg.datasets, parts))
-            )
-        for entry, ds in zip(val_cfg.datasets, parts):
-            loader = DataLoader(
-                ds,
-                batch_size=train_cfg.batch_size,
-                # 多卡分片并行验证：每 rank 评估自己的 shard，run_val 末尾
-                # all_reduce 聚合。注意 DistributedSampler 会补齐到整除
-                # world_size（重复末几条样本），对指标影响可忽略。
-                sampler=(
-                    DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
-                    if world_size > 1
-                    else None
-                ),
-                shuffle=False,
-                num_workers=2,
-                pin_memory=True,
-            )
-            val_loaders.append((str(entry.name), loader))
-            logger.info(f"val dataset {entry.name}: {len(ds)} samples")
-        return train_loader, val_loaders, sampler
-
-    # Legacy: single val dataset (ConcatDataset style)
+    # Val is sharded across ranks (see run_val); a plain loader suffices.
     max_val = cfg.trainer.data.get("max_val_samples")
     if max_val is not None and len(val_ds) > int(max_val):
         from torch.utils.data import Subset
 
-        # 等距采样拼接后的整个 val 集（而非取前 N 条，否则只覆盖列表首个
-        # 数据集）：各数据集按占比混合，且采样确定性、跨 checkpoint 可比
+        # 等距采样整个 val 集，采样确定、跨 checkpoint 可比
         n = len(val_ds)
         k = int(max_val)
-        val_ds = Subset(
-            val_ds, sorted({round(i * n / k) for i in range(k)})
-        )
-        from torch.utils.data import ConcatDataset
-
-        if isinstance(val_ds.dataset, ConcatDataset):
-            parts = val_ds.dataset.datasets
-            bounds = [sum(map(len, parts[:j])) for j in range(1, len(parts) + 1)]
-            origin = [
-                sum(1 for i in val_ds.indices if lo <= i < hi)
-                for lo, hi in zip([0] + bounds, bounds)
-            ]
-            logger.info(f"val subsample {len(val_ds)}: per-dataset {origin}")
+        val_ds = Subset(val_ds, sorted({round(i * n / k) for i in range(k)}))
+        logger.info(f"val subsample -> {len(val_ds)} samples")
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
@@ -475,7 +374,8 @@ def compute_loss(preds, targets, time_weight, lambda_v, lambda_3d, lambda_2d=0.0
 
 
 # --------------------------------------------------------------------------
-# Validation (rank 0, on the unwrapped module — no DDP collectives involved)
+# Validation (sharded across ranks on the unwrapped module; metrics
+# all_reduced at the end of each dataset)
 # --------------------------------------------------------------------------
 
 METRIC_KEYS = ("mpjpe", "pa_mpjpe", "mpvpe", "pa_mpvpe")
@@ -491,9 +391,8 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
 
     val_loaders: list of (name, DataLoader). With world_size > 1 each rank
     evaluates its DistributedSampler shard and metric sums are all_reduced.
-    Each batch routes by its GT schema: `mano_params` (DexYCB) ->
-    build_loss_dicts; `joints_gt/verts_gt` (HO3D_v3 evaluation split, no MANO
-    GT) -> mano_forward. Returns {name: {metric: mean_mm}} per dataset.
+    Each batch carries MANO GT -> build_loss_dicts; metrics are
+    MPJPE / PA-MPJPE / MPVPE / PA-MPVPE in mm. Returns {name: {metric: mean_mm}}.
     """
     raw_model.eval()
     results = {}
@@ -510,25 +409,15 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
                         pcl_xyz=batch["pcl_xyz"].to(device) if "pcl_xyz" in batch else None,
                         pcl_rgb=batch["pcl_rgb"].to(device) if "pcl_rgb" in batch else None,
                     )
-                    if "mano_params" in batch:
-                        preds, targets = raw_model.build_loss_dicts(
-                            samples, batch["mano_params"].to(device)
-                        )
-                        errs = joint_mesh_errors(
-                            preds["landmarks_3d"].float(),
-                            targets["landmarks_3d"].float(),
-                            preds["vertices"].float(),
-                            targets["vertices"].float(),
-                        )
-                    else:
-                        betas = raw_model.fixed_betas.expand(samples.shape[0], -1)
-                        pred_out = raw_model.mano_forward(samples, betas=betas)
-                        errs = joint_mesh_errors(
-                            pred_out["landmarks_3d"].float(),
-                            batch["joints_gt"].to(device).float(),
-                            pred_out["vertices"].float(),
-                            batch["verts_gt"].to(device).float(),
-                        )
+                    preds, targets = raw_model.build_loss_dicts(
+                        samples, batch["mano_params"].to(device)
+                    )
+                    errs = joint_mesh_errors(
+                        preds["landmarks_3d"].float(),
+                        targets["landmarks_3d"].float(),
+                        preds["vertices"].float(),
+                        targets["vertices"].float(),
+                    )
                 for k in METRIC_KEYS:
                     sums[k] += errs[k].float().sum().item()
                 n += errs["mpjpe"].shape[0]

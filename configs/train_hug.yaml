@@ -64,5 +64,5 @@ trainer:
     log_every: 20
     val_every: 2000
     ckpt_every: 5000
-    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/train_output
+    output_dir: /root/code/vepfs/HUG-HMILab/train_output   # vepfs 大文件系统，勿写根分区
     resume: null                    # checkpoint 路径，非空则续训
