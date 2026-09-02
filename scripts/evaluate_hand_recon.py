@@ -20,7 +20,7 @@ import tyro
 from omegaconf import OmegaConf
 from rich.console import Console
 from rich.table import Table
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Sampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -60,6 +60,19 @@ class ReconDataset(GraspDataset):
             out["joints_gt"] = joints
             out["verts_gt"] = verts
         return out
+
+
+class StridedSampler(Sampler[int]):
+    """Distributed sampler without padding/duplicating tail samples."""
+
+    def __init__(self, size: int, rank: int, world_size: int):
+        self.indices = list(range(rank, size, world_size))
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
 
 
 def evaluate_dataset(name, model, loader, device, rank, world_size, bf16, steps):
@@ -173,7 +186,7 @@ def main(
         if limit is not None:
             ds.grasp_files = ds.grasp_files[: int(limit)]
         sampler = (
-            DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
+            StridedSampler(len(ds), rank, world_size)
             if world_size > 1
             else None
         )
