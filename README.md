@@ -147,7 +147,7 @@ torchrun --nproc_per_node=4 -m hug.eval_test \
   --config configs/train_handrecon.yaml
 ```
 
-纯 PyTorch PointNeXt 会在 SA 层构造较大的 kNN 临时张量；训练时应使用多卡和合适的 batch size。当前服务器已有一轮 4 卡 hand-recon 训练在运行，额外启动训练可能发生显存不足；这不影响单样本推理和可视化。
+纯 PyTorch PointNeXt 会在 SA 层构造较大的 kNN 临时张量；训练时应使用多卡和合适的 batch size。显存有限时可先降低 batch size 或使用单卡 smoke test；这不影响单样本推理和可视化。
 
 ## 数据约定
 
@@ -158,14 +158,6 @@ torchrun --nproc_per_node=4 -m hug.eval_test \
 - 推理 checkpoint 自带模型配置和 norm stats，避免模态开关与权重不匹配。
 
 HO3D/DexYCB 转换、6D 旋转约定、MANO wrist 平移参考点和评测口径的修复说明见 `analysis_docs/handrecon_conversion_bugs.md`。
-
-## 当前验收记录
-
-- 目标包已安装为 editable `hug`，导入路径指向 `/root/code/HUG-HMILab/src`。
-- 自定义输入已成功生成 `data/custom/custom.pkl`。
-- 使用共享 HUG checkpoint 完成 2-step inference smoke，成功写出 `data/custom/grasp_pred/custom.pkl`。
-- `visualize_predictions` 已成功监听端口并显示 `Visualizing: custom`。
-- 训练 smoke 曾因现有 4 卡训练占用显存，以及纯 PyTorch kNN 临时张量导致 OOM；按当前任务要求暂不处理。
 
 ## 论文
 
