@@ -1,0 +1,17 @@
+prediction_images/*
+# Large MANO/SMPL-H assets are provisioned outside Git
+assets/mano/models/SMPLH_male.pkl
+assets/mano/models/SMPLH_female.pkl
+# Runtime checkpoints and generated predictions
+checkpoints/
+outputs/
+
+# Python caches and local metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+
+# Generated inference outputs
+prediction_images/
+data/*/grasp_pred/

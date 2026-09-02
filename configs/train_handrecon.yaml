@@ -1,0 +1,97 @@
+# HUG 手部重建训练配置（DexYCB + HO3D_v3）
+# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon.yaml
+# 数据: scripts/convert_ho3d.py / convert_dexycb.py 转换产物
+# 划分: scripts/make_handrecon_splits.py 生成（DexYCB 官方 s0，HO3D 按序列留出）
+# norm_stats: scripts/compute_norm_stats.py（仅训练集，无 test 泄漏）
+
+trainer:
+  model:
+    # ---- 模态开关（与论文 full model 一致）----
+    use_rgb: true
+    use_depth: true
+    use_2d_point: false
+    use_pointpainting: true
+    # ---- RGB 编码器（冻结 DINOv2）----
+    encoder_name: facebook/dinov2-with-registers-base
+    # ---- 点云编码器（可训练 PointNeXt）----
+    pcl_width: 64
+    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
+    pcl_blocks: [1, 2, 1, 1]
+    pcl_use_rgb: true
+    # ---- 融合 ----
+    d_fusion: 1024
+    n_patches: 256
+    fusion_layers: 4
+    fusion_heads: 8
+    patch_grid_size: 16
+    image_size: 224
+    fourier_scale: 1.0
+    dropout: 0.1
+    # ---- flow transformer (DiT) ----
+    d_mano: 99
+    d_model: 512
+    flow_layers: 6
+    flow_heads: 8
+    sampling_steps: 50
+    # ---- 手比物体小：0.3m → 0.2m，让 4096 点密集覆盖手部 ----
+    pcl_crop_radius: 0.2
+
+  data:
+    datasets:
+      - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
+        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt
+        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_val.clean.txt
+      - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt
+        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_val.clean.txt
+    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_handrecon_v2.json
+    n_points_input: 4096
+    max_val_samples: 4096          # val 等距采样 4096 条（HO3D+DexYCB 按占比混合），控制单次评估耗时
+    num_workers: 16
+    prefetch_factor: 4
+
+  train:
+    total_steps: 25000             # 预训练权重 finetune，25k 步即可（当前 model.pt 已训 ~30k，超出预算，无需再训）
+    batch_size: 200                # 每张卡 batch
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    warmup_steps: 2500             # total_steps 的 10%
+    lr_min_ratio: 0.0              # warmup 后 cosine 衰减到 lr * lr_min_ratio（0 = 衰减到 0）
+    grad_clip: 1.0
+    lambda_v: 1.0
+    lambda_3d: 20.0
+    lambda_2d: 1.0                 # 2D 重投影损失权重：预测 MANO 关节经 camera_K 投影 vs GT landmarks_2d（像素 L1 / image_size，(1-t) 加权）
+    ema_start_step: 12500          # total_steps 的 50%（论文 50K/100K 同比例）
+    ema_decay: 0.999
+    bf16: true
+    seed: 42
+    log_every: 20
+    heartbeat_every: 20              # 长时间 batch/val/checkpoint 前的存活事件间隔
+    val_every: 1000
+    ckpt_every: 1000          # 与 val_every 对齐，续训点即评估点
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260902_v6_canonical
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260902_v6_canonical.jsonl                  # 训练日志(jsonl)路径+文件名；null 则默认 <output_dir>/train_log.jsonl；相对路径按 output_dir 解析
+    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors  # HUG 预训练权重（EMA），仅加载模型参数做 finetune
+    resume: null                   # 已训 ~30k > 25k 预算，训练完成；如需重训再设
+
+  val:                            # 训练中验证/选型集（真实采样指标，无 loss）
+    max_samples: 4096             # 每次验证总样本数（各数据集按占比等距采样，确定性）
+    datasets:
+      - name: dexycb_s0_val        # DexYCB 官方 s0_val（MANO GT）
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_val.clean.txt
+      - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
+        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt
+
+  test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
+    batch_size: 256                # 每卡 batch
+    out: null                      # 结果 json 输出路径；null 则默认 <output_dir>/test_results.json
+    datasets:
+      - name: dexycb_test          # DexYCB 官方 s0_test（MANO GT，走 sample+build_loss_dicts）
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+      - name: ho3d_eval            # HO3D_v3 官方 evaluation split（joints/verts GT，无 MANO，走推理路径）
+        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt
